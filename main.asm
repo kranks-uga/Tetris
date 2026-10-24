@@ -23,9 +23,34 @@ s_bottom:   db "<!====================!>",13,10,"Счет: "
 s_bottom_len equ $-s_bottom
 s_help:     db "    ",13,10,"a/d— перемещение, w — поворот, s — вниз, пробел — сброс, q — выход",13,10
 s_help_len  equ $-s_help
-s_fini:     db 27,"[0m",27,"[?25h",13,10,"Игра окончена! Счет: "
+s_fini:     db 27,"[0m",27,"[2J",27,"[H",27,"[?25h"
 s_fini_len  equ $-s_fini
-s_nl:       db 10
+; экран конца игры — поверх середины поля
+s_over:     db 27,"[0m"
+            db 27,"[9;3H",  "                    "
+            db 27,"[10;3H", "   Игра окончена!   "
+            db 27,"[11;3H", "                    "
+            db 27,"[12;3H", "    Enter - меню    "
+            db 27,"[13;3H", "     Q - выход      "
+            db 27,"[14;3H", "                    "
+s_over_len  equ $-s_over
+
+; --- меню ---
+s_menu:     db 27,"[3;8H","T E T R I S"
+            db 27,"[9;2H","A/D - изменить скорость"
+            db 27,"[10;2H","Enter - старт   Q - выход"
+            db 27,"[6;2H","Скорость:  < "           ; дальше — значение
+s_menu_len  equ $-s_menu
+sp_slow:    db "Медленно"
+sp_slow_len equ $-sp_slow
+sp_norm:    db "Нормально"
+sp_norm_len equ $-sp_norm
+sp_fast:    db "Быстро"
+sp_fast_len equ $-sp_fast
+; пары (адрес, длина) по 16 байт
+speed_tab:  dq sp_slow, sp_slow_len, sp_norm, sp_norm_len, sp_fast, sp_fast_len
+fall_tab:   dd 15, 10, 5                      ; тиков на шаг падения для каждой скорости
+speed:      dd 1                              ; выбранная скорость (по умолчанию нормальная)
 
 timespec:   dq 0, 50000000                    ; тик = 50 мс
 
@@ -43,6 +68,7 @@ px:     resd 1
 py:     resd 1
 score:  resd 1
 ticks:  resd 1
+fall:   resd 1          ; тиков на шаг падения (из меню)
 seed:   resq 1
 
 section .text
@@ -268,13 +294,112 @@ draw:
     mov rsi, s_help
     mov ecx, s_help_len
     rep movsb
+    ; дальше — flush
 
+; flush: выводит outbuf до rdi одним write
+flush:
     mov rdx, rdi
     sub rdx, outbuf
     mov eax, 1              ; write(1, outbuf, len)
     mov edi, 1
     mov rsi, outbuf
     syscall
+    ret
+
+; wait_keys: ждёт нажатия -> eax = сколько байт прочитано в keys
+wait_keys:
+    xor eax, eax            ; read(0, keys, 16)
+    xor edi, edi
+    mov rsi, keys
+    mov edx, 16
+    syscall
+    test eax, eax
+    jg .ret
+    mov eax, 35             ; ничего не нажато — подождать
+    mov rdi, timespec
+    xor esi, esi
+    syscall
+    jmp wait_keys
+.ret:
+    ret
+
+; ---------------------------------------------------------------
+; menu: стартовый экран. A/D (стрелки ←/→) — скорость, Enter/пробел — старт.
+; Пишет скорость в fall -> eax = 1, если нажата q, иначе 0
+menu:
+.draw:
+    mov rdi, outbuf
+    mov rsi, s_init
+    mov ecx, s_init_len
+    rep movsb
+    mov rsi, s_menu
+    mov ecx, s_menu_len
+    rep movsb
+    mov eax, [speed]
+    shl eax, 4
+    mov rsi, [speed_tab+rax]
+    mov ecx, [speed_tab+rax+8]
+    rep movsb
+    mov ax, ' >'
+    stosw
+    call flush
+
+    call wait_keys
+    mov r14d, eax
+    xor r13d, r13d
+.key:
+    cmp r13d, r14d
+    jae .draw
+    movzx eax, byte [keys+r13]
+    inc r13d
+    cmp al, 27
+    jne .plain
+    lea ecx, [r13+1]        ; стрелки: ESC [ C — вправо, ESC [ D — влево
+    cmp ecx, r14d
+    jae .key
+    cmp byte [keys+r13], '['
+    jne .key
+    movzx eax, byte [keys+r13+1]
+    add r13d, 2
+    cmp al, 'C'
+    je .right
+    cmp al, 'D'
+    je .left
+    jmp .key
+.plain:
+    cmp al, 'q'
+    je .quit
+    cmp al, 10              ; Enter
+    je .start
+    cmp al, 13
+    je .start
+    cmp al, ' '
+    je .start
+    cmp al, 'a'
+    je .left
+    cmp al, 'd'
+    je .right
+    jmp .key
+.left:
+    dec dword [speed]
+    jns .key
+    mov dword [speed], 2    ; по кругу: на последнее значение
+    jmp .key
+.right:
+    inc dword [speed]
+    cmp dword [speed], 3
+    jb .key
+    mov dword [speed], 0    ; по кругу: на первое значение
+    jmp .key
+
+.start:
+    mov eax, [speed]        ; скорость -> тиков на шаг падения
+    mov eax, [fall_tab+rax*4]
+    mov [fall], eax
+    xor eax, eax
+    ret
+.quit:
+    mov eax, 1
     ret
 
 ; ---------------------------------------------------------------
@@ -298,17 +423,28 @@ _start:
     mov rdx, raw_t
     syscall
 
-    mov eax, 1
-    mov edi, 1
-    mov rsi, s_init
-    mov edx, s_init_len
-    syscall
-
     rdtsc                   ; зерно для ГПСЧ
     shl rdx, 32
     or rax, rdx
     or rax, 1
     mov [seed], rax
+
+new_game:                   ; сюда же возвращаемся после конца партии
+    mov rdi, board
+    mov ecx, W*H
+    xor eax, eax
+    rep stosb
+    mov [score], eax
+    mov [ticks], eax
+    call menu
+    test eax, eax
+    jnz .quit
+
+    mov eax, 1
+    mov edi, 1
+    mov rsi, s_init
+    mov edx, s_init_len
+    syscall
     call spawn
 
 .loop:
@@ -376,7 +512,8 @@ _start:
 
 .gravity:
     inc dword [ticks]
-    cmp dword [ticks], 10   ; падение раз в 10 тиков = 0.5 с
+    mov eax, [fall]         ; падение раз в fall тиков (10 = 0.5 с)
+    cmp [ticks], eax
     jb .loop
     mov dword [ticks], 0
     mov ebx, [rot]
@@ -392,8 +529,32 @@ _start:
     test eax, eax
     jnz .loop
 
-.quit:
+    ; конец игры: Enter — в меню, q — выход.
+    ; Пробел не принимаем: он мог остаться зажатым после сброса фигуры
     call draw
+    mov eax, 1
+    mov edi, 1
+    mov rsi, s_over
+    mov edx, s_over_len
+    syscall
+.over_wait:
+    call wait_keys
+    mov r12d, eax
+    xor r13d, r13d
+.over_key:
+    movzx eax, byte [keys+r13]
+    cmp al, 'q'
+    je .quit
+    cmp al, 10
+    je new_game
+    cmp al, 13
+    je new_game
+    inc r13d
+    cmp r13d, r12d
+    jb .over_key
+    jmp .over_wait
+
+.quit:
     mov eax, 16             ; восстанавливаем терминал
     xor edi, edi
     mov esi, 0x5402
@@ -403,17 +564,6 @@ _start:
     mov edi, 1
     mov rsi, s_fini
     mov edx, s_fini_len
-    syscall
-    mov rdi, outbuf
-    mov eax, [score]
-    call itoa
-    mov byte [rdi], 10
-    inc rdi
-    mov rdx, rdi
-    sub rdx, outbuf
-    mov eax, 1
-    mov edi, 1
-    mov rsi, outbuf
     syscall
     mov eax, 60             ; exit(0)
     xor edi, edi
